@@ -388,18 +388,24 @@ class SerialSSHClient:
             except Exception:
                 self._alive = False
 
-    def recv_loop(self):
-        log.debug("Shell receive loop started")
+    def recv_loop(self, echo=False):
+        """Forward SSH channel bytes to UART until channel closes."""
+        log.debug("Shell receive loop started (echo=%s)", echo)
         try:
+            self.channel.settimeout(1.0)
             while self._alive and self.channel.active:
                 try:
                     data = self.channel.recv(4096)
                     if not data:
                         break
+                    if echo:
+                        try:
+                            self.channel.send(data)
+                        except Exception:
+                            break
                     try:
                         self.serial_mgr.write(data)
                     except Exception as e:
-                        # Never break SSH just because serial write failed.
                         log.error(f"Shell serial write failed (ignored): {e}")
                         time.sleep(0.05)
                 except socket.timeout:
@@ -415,6 +421,144 @@ class SerialSSHClient:
             except Exception:
                 pass
 
+
+def _chan_send(chan, text: str) -> None:
+    if chan.active:
+        chan.send(text.encode("utf-8", errors="replace"))
+
+
+def _read_interactive_line(chan) -> str | None:
+    """Read one line with local echo (PTY-friendly for MCP terminals)."""
+    buf = bytearray()
+    while chan.active:
+        try:
+            data = chan.recv(1)
+        except socket.timeout:
+            continue
+        if not data:
+            return None
+        ch = data[0]
+        if ch in (10, 13):
+            _chan_send(chan, "\r\n")
+            return buf.decode("utf-8", errors="replace").strip()
+        if ch in (127, 8):
+            if buf:
+                buf.pop()
+                chan.send(b"\x08 \x08")
+            continue
+        if ch == 3:
+            _chan_send(chan, "^C\r\n")
+            return ""
+        if ch < 32 and ch not in (9,):
+            continue
+        buf.extend(data)
+        chan.send(data)
+    return None
+
+
+def _bridge_welcome(serial_mgr) -> str:
+    lines = [
+        "\r\n=== Serial SSH Bridge (management shell) ===\r\n",
+    ]
+    if serial_mgr.ser:
+        lines.append(f"Serial: {serial_mgr.ser.port} @ {serial_mgr.ser.baudrate}\r\n")
+    else:
+        lines.append("Serial: disabled (test mode)\r\n")
+    lines.append(
+        "Type 'help' for commands. Use 'attach' to enter raw serial passthrough.\r\n"
+        "UART upgrade: run SSH exec 'uart-upgrade' from another session.\r\n\r\n"
+    )
+    return "".join(lines)
+
+
+def _run_bridge_shell(chan, serial_mgr, client: SerialSSHClient) -> None:
+    """
+    Interactive bridge shell for MCP / Claude Code terminals.
+
+    Unlike raw passthrough, this keeps a prompt-driven session alive so clients
+    that expect a persistent shell do not treat the SSH session as dead.
+    """
+    chan.settimeout(1.0)
+    _chan_send(chan, _bridge_welcome(serial_mgr))
+
+    try:
+        while client._alive and chan.active:
+            _chan_send(chan, "bridge> ")
+            line = _read_interactive_line(chan)
+            if line is None:
+                break
+            cmd = line.strip().lower()
+            if not cmd:
+                continue
+            if cmd in ("exit", "quit"):
+                _chan_send(chan, "bye\r\n")
+                break
+            if cmd == "help":
+                _chan_send(
+                    chan,
+                    "Commands:\r\n"
+                    "  help    - show this help\r\n"
+                    "  status  - bridge / serial / shell status\r\n"
+                    "  attach  - enter raw serial passthrough (type ~. alone to return)\r\n"
+                    "  exit    - close SSH session\r\n"
+                    "Upgrade: ssh exec uart-upgrade (separate SSH session)\r\n",
+                )
+                continue
+            if cmd == "status":
+                ser = serial_mgr.ser
+                if ser:
+                    _chan_send(
+                        chan,
+                        f"serial={ser.port} baud={ser.baudrate} "
+                        f"upgrade_active={serial_mgr._upgrade_active.is_set()}\r\n",
+                    )
+                else:
+                    _chan_send(chan, "serial=disabled\r\n")
+                _chan_send(chan, f"shells_online={serial_mgr.shell_count()}\r\n")
+                continue
+            if cmd == "attach":
+                _chan_send(
+                    chan,
+                    "\r\n[serial attach] raw passthrough; type ~. on its own line to return\r\n",
+                )
+                _serial_attach_until_detach(chan, serial_mgr, client)
+                continue
+            _chan_send(chan, f"unknown command: {line!r} (type help)\r\n")
+    finally:
+        client._alive = False
+        serial_mgr.unregister_shell(client)
+        try:
+            chan.close()
+        except Exception:
+            pass
+
+
+def _serial_attach_until_detach(chan, serial_mgr, client: SerialSSHClient) -> None:
+    """Raw passthrough with optional detach via a lone '~.' line."""
+    chan.settimeout(0.2)
+    tail = bytearray()
+    while client._alive and chan.active:
+        try:
+            data = chan.recv(4096)
+        except socket.timeout:
+            continue
+        if not data:
+            break
+        tail.extend(data)
+        if len(tail) > 64:
+            tail = tail[-64:]
+        if (
+            tail.endswith(b"~.\r\n")
+            or tail.endswith(b"~.\n")
+            or tail.endswith(b"~.\r")
+        ):
+            _chan_send(chan, "\r\n[serial detach]\r\n")
+            return
+        try:
+            serial_mgr.write(data)
+        except Exception as e:
+            log.error(f"Shell serial write failed (ignored): {e}")
+
 # ──────────────────────── SSH Server ────────────────────────
 class SerialSSHServer(paramiko.ServerInterface):
     def __init__(self, serial_mgr, username="admin", password="123456"):
@@ -423,6 +567,7 @@ class SerialSSHServer(paramiko.ServerInterface):
         self.username = username
         self.password = password
         self.exec_command = None
+        self.want_pty = False
 
     def check_auth_password(self, username, password):
         if username == self.username and password == self.password:
@@ -437,6 +582,7 @@ class SerialSSHServer(paramiko.ServerInterface):
     def check_channel_pty_request(
         self, channel, term, width, height, pixelwidth, pixelheight, modes
     ):
+        self.want_pty = True
         return True
 
     def check_channel_shell_request(self, channel):
@@ -450,7 +596,7 @@ class SerialSSHServer(paramiko.ServerInterface):
 
 
 def handle_connection(
-    client_sock, addr, host_key, serial_mgr, ssh_user, ssh_pass, upgrade_runner
+    client_sock, addr, host_key, serial_mgr, ssh_user, ssh_pass, upgrade_runner, shell_mode
 ):
     transport = None
     client = None
@@ -554,8 +700,17 @@ def handle_connection(
             "Start UART upgrade: SSH exec uart-upgrade (or __uart_upgrade__)\r\n"
             "Check dependencies: SSH exec __uart_deps__\r\n\r\n"
         )
-        chan.send(welcome.encode("utf-8"))
-        client.recv_loop()
+
+        use_bridge_shell = shell_mode == "bridge" or (
+            shell_mode == "auto" and server.want_pty
+        )
+        if use_bridge_shell:
+            log.info("SSH shell mode: bridge (pty=%s)", server.want_pty)
+            _run_bridge_shell(chan, serial_mgr, client)
+        else:
+            log.info("SSH shell mode: passthrough (pty=%s)", server.want_pty)
+            chan.send(welcome.encode("utf-8"))
+            client.recv_loop(echo=server.want_pty)
 
     except Exception as e:
         log.error(f"Client {addr} error: {e}")
@@ -656,6 +811,16 @@ def main():
         help="Mirror debug lines to SSH shells (requires --uart-debug)",
     )
     parser.add_argument(
+        "--shell-mode",
+        choices=("passthrough", "bridge", "auto"),
+        default="auto",
+        help=(
+            "SSH shell behavior: passthrough=raw serial immediately; "
+            "bridge=management shell (MCP-friendly); "
+            "auto=bridge when client requests a PTY (default)"
+        ),
+    )
+    parser.add_argument(
         "--check-deps",
         action="store_true",
         help="Check UART upgrade dependencies and exit",
@@ -711,6 +876,7 @@ def main():
     sock.listen(args.listen_backlog)
 
     log.info(f"SSH Server: {args.bind}:{args.ssh_port}")
+    log.info(f"SSH shell mode: {args.shell_mode}")
     log.info(f"Credentials: {args.ssh_user} / {args.ssh_pass}")
     log.info(
         f"Concurrency: workers={args.max_workers}, pending={args.max_pending}, "
@@ -746,6 +912,7 @@ def main():
                 args.ssh_user,
                 args.ssh_pass,
                 upgrade_runner,
+                args.shell_mode,
             )
         finally:
             pending_slots.release()
