@@ -20,6 +20,63 @@ def _runtime_dir() -> str:
 
 log = logging.getLogger("uart-dl")
 
+# FIP slice download order and CLI aliases (BL31 -> monitor.bin in this FIP layout).
+FIP_STAGE_ALIASES = (
+    ("param1.bin", ("param1", "p1")),
+    ("blcp.bin", ("blcp",)),
+    ("bl2.bin", ("bl2",)),
+    ("p2.bin", ("p2",)),
+    ("monitor.bin", ("monitor", "bl31")),
+    ("bl32.bin", ("bl32",)),
+    ("mcu.bin", ("mcu",)),
+    ("l2h.bin", ("l2h",)),
+    ("l2.bin", ("l2",)),
+)
+STOP_AFTER_FIP_DONE = "__fip_done__"
+STOP_AFTER_FULL = "__full__"
+
+
+def normalize_stop_after(name: str | None) -> str | None:
+    """
+    Resolve user input to a stop token:
+    - None / '' / full / uboot / all -> None (run complete upgrade)
+    - fip -> STOP_AFTER_FIP_DONE (after last FIP slice)
+    - fip.bin -> 'fip.bin' (after U-Boot whole-fip Kermit)
+    - bl31, monitor, bl2, ... -> canonical slice basename e.g. monitor.bin
+    """
+    if not name or not str(name).strip():
+        return None
+    key = str(name).strip().lower().replace("-", "").replace("_", "")
+    if key in ("full", "uboot", "all", "complete"):
+        return None
+    if key in ("fip", "fipslices", "fipdownload"):
+        return STOP_AFTER_FIP_DONE
+    if key in ("fipbin",):
+        return "fip.bin"
+    for basename, aliases in FIP_STAGE_ALIASES:
+        base_key = basename.replace(".bin", "")
+        if key in (base_key, basename.replace(".", "")) or key in aliases:
+            return basename
+    known = sorted(
+        {
+            *("fip", "fip.bin", "full"),
+            *(a for _, aliases in FIP_STAGE_ALIASES for a in aliases),
+            *(b.replace(".bin", "") for b, _ in FIP_STAGE_ALIASES),
+        }
+    )
+    raise ValueError(
+        f"Unknown stop-after target {name!r}; known: {', '.join(known)}"
+    )
+
+
+def format_stop_after_help() -> str:
+    stages = ", ".join(f"{aliases[0]}({basename})" if aliases else basename
+                       for basename, aliases in FIP_STAGE_ALIASES)
+    return (
+        f"FIP stages: {stages}; "
+        "also: fip (all FIP slices), fip.bin (after U-Boot fip.bin), full (default)"
+    )
+
 
 class DevNull:
     def write(self, *_):
@@ -52,6 +109,7 @@ class UartDownload:
         on_status=None,
         uboot_baudrate=None,
         skip_uboot_update=False,
+        stop_after=None,
         debug=False,
         debug_ssh=False,
     ):
@@ -74,6 +132,7 @@ class UartDownload:
         self._phase = ""
         self._progress_last_pct = -1
         self.skip_uboot_update = skip_uboot_update
+        self.stop_after = normalize_stop_after(stop_after)
         # Retry policy: keep the bridge process alive on transient failures.
         self.kermit_retries = 3
         self.kermit_retry_delay = 1.0
@@ -171,6 +230,27 @@ class UartDownload:
                 self._status(f"Kermit send failed: {filename} err={e!r}")
                 # keep looping; raise after final attempt
         raise last
+
+    def _handover_serial(self, reason: str) -> None:
+        """Reset link and return UART to SSH passthrough / CLI."""
+        self._port.baudrate = self.baudrate
+        self._drain_rx(idle_sec=0.05, max_total=0.3)
+        self._status(reason)
+        self._status(
+            "UART I/O released to SSH shells — use attach or passthrough for target CLI."
+        )
+
+    def _should_stop_after_fip_slice(self, filename: str) -> bool:
+        if not self.stop_after or self.stop_after == STOP_AFTER_FULL:
+            return False
+        if self.stop_after == STOP_AFTER_FIP_DONE:
+            return filename == self.fip_filelist[-1]
+        return filename == self.stop_after
+
+    def _fip_stop_label(self) -> str:
+        if self.stop_after == STOP_AFTER_FIP_DONE:
+            return "FIP download phase"
+        return self.stop_after or ""
 
     def _maybe_report_io(self, force=False):
         if not self.debug:
@@ -342,6 +422,16 @@ class UartDownload:
         self.addr = (int(r.group(1)), int(r.group(2)))
         self._status(f"Download session addr={self.addr}")
 
+        if (
+            self.stop_after
+            and self.stop_after not in (STOP_AFTER_FIP_DONE, "fip.bin")
+            and self.stop_after not in self.fip_filelist
+        ):
+            raise ValueError(
+                f"stop-after target {self.stop_after!r} not in this fip.bin "
+                f"(available: {self.fip_filelist})"
+            )
+
         self._getc_byte_timeout = self.kermit_byte_timeout
         self._set_port_read_timeout(self.kermit_read_timeout)
 
@@ -360,14 +450,25 @@ class UartDownload:
             if self.debug:
                 self._debug("ek18.start FIP slice %r", filename)
             self._kermit_start_with_retry(filename)
+            if self._should_stop_after_fip_slice(filename):
+                self._handover_serial(
+                    f"Stopped after {self._fip_stop_label()} — serial ready for target CLI."
+                )
+                return
 
         self._status("FIP download phase completed.")
+
+        if self.stop_after == STOP_AFTER_FIP_DONE:
+            self._handover_serial(
+                "Stopped after FIP download phase — serial ready for target CLI."
+            )
+            return
 
         # After FIP stages, either continue into U-Boot update phase or hand over to shell.
         self._port.baudrate = self.baudrate
         if self.skip_uboot_update:
-            self._status(
-                "Skip U-Boot update phase: handing UART I/O back to SSH shells for U-Boot CLI."
+            self._handover_serial(
+                "Skip U-Boot update phase — serial ready for U-Boot CLI."
             )
             return
 
@@ -419,6 +520,11 @@ class UartDownload:
                     )
                 if inter_delay > 0:
                     time.sleep(inter_delay)
+                if self.stop_after == "fip.bin" and filename == "fip.bin":
+                    self._handover_serial(
+                        "Stopped after U-Boot fip.bin — serial ready for U-Boot CLI."
+                    )
+                    return
         finally:
             self._getc_byte_timeout = self.kermit_byte_timeout
             self._set_port_read_timeout(self.kermit_read_timeout)

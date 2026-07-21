@@ -109,6 +109,16 @@ claude mcp add mcp-interactive-terminal -- npx -y mcp-interactive-terminal
 3. Start Claude Code and run `/mcp` to verify the terminal is loaded.
 4. Ask Claude to read your Skill first so it understands the workflow and roles before operating the device.
 
+**MCP terminal keeps disconnecting?**  
+`mcp-interactive-terminal` expects a **persistent interactive shell** (prompt + echo). Older bridge versions jumped straight into **raw serial passthrough** after the banner; with a quiet UART the session looks dead and MCP may treat it as closed.
+
+The default `--shell-mode auto` uses a **bridge management shell** (`bridge>` prompt) when the client requests a PTY (MCP / interactive SSH). Use `attach` for raw serial, `status` for bridge state; non-PTY `ssh` still gets passthrough. You can also force a mode:
+
+```powershell
+.\serial_ssh_bridge.exe -p COM3 --ssh-port 2222 --shell-mode bridge       # always management shell (best for MCP)
+.\serial_ssh_bridge.exe -p COM3 --ssh-port 2222 --shell-mode passthrough  # always raw passthrough
+```
+
 ### Claude skills
 
 1. Put skill files under `.claude/skills/`.
@@ -137,8 +147,6 @@ cd bridge\dist
 3. Verify MCP terminal is connected (`/mcp`), then instruct Claude to:
    - read serial output
    - run `uart-upgrade` (SSH exec) when needed
-### Video
-https://github.com/user-attachments/assets/f5fc135c-5cf8-4dd7-a395-6777bbb5149f
 
 #### Mode B: Manual SSH (no Claude)
 
@@ -305,7 +313,8 @@ Windows exe does not run on Linux. On Ubuntu, install the same deps, run `python
 | `--uart-dl-dir` | exe/script directory | Work dir for `fip.bin` |
 | `--uart-reboot-timeout` | `300` | Timeout (s) waiting for URPL |
 | `--uboot-baudrate` | `1500000` | U-Boot Kermit baud rate |
-| `--skip-uboot-update` | off | FIP slices only; skip U-Boot `fip.bin` |
+| `--skip-uboot-update` | off | FIP slices only; skip U-Boot `fip.bin` (same as `--stop-after fip`) |
+| `--stop-after STAGE` | none (full flow) | Stop after a stage and release serial for target CLI (see below) |
 | `--uart-debug` | off | Verbose logs under `log/uart_debug.log` |
 | `--uart-debug-ssh` | off | Mirror debug to SSH (needs `--uart-debug`) |
 | `--check-deps` | - | Check dependencies and exit |
@@ -320,7 +329,32 @@ Windows exe does not run on Linux. On Ubuntu, install the same deps, run `python
 
 ```powershell
 .\serial_ssh_bridge.exe -p COM3 --skip-uboot-update
+# equivalent:
+.\serial_ssh_bridge.exe -p COM3 --stop-after fip
 ```
+
+### Example: stop after BL31 for BL31 CLI
+
+In this FIP layout **BL31 maps to `monitor.bin`**. After that slice finishes, serial is released to SSH passthrough / `attach`:
+
+```powershell
+.\serial_ssh_bridge.exe -p COM3 --stop-after bl31
+```
+
+Override per upgrade via SSH exec:
+
+```bash
+ssh -p 2222 admin@<bridge_ip> uart-upgrade --stop-after bl31
+```
+
+**`--stop-after` targets:**
+
+| Value | Meaning |
+|-------|---------|
+| `bl2`, `p2`, `bl31`/`monitor`, `bl32`, `mcu`, `l2`, `l2h`, `param1` | Stop after that FIP slice |
+| `fip` | Stop after all FIP slices (no U-Boot whole-file phase) |
+| `fip.bin` | Stop after U-Boot `fip.bin` Kermit completes |
+| unset / `full` | Full upgrade (default) |
 
 ## SCP upload to the bridge
 

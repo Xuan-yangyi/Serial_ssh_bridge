@@ -16,6 +16,7 @@ from uart_upgrade import (
     UartUpgradeRunner,
     check_uart_upgrade_deps,
     is_upgrade_command,
+    parse_upgrade_command,
 )
 
 # ──────────────────────── Logging ────────────────────────
@@ -629,7 +630,11 @@ def handle_connection(
             if isinstance(cmd, bytes):
                 cmd = cmd.decode("utf-8", errors="replace")
             if is_upgrade_command(cmd):
-                started, msg = upgrade_runner.start()
+                up_opts = parse_upgrade_command(cmd)
+                started, msg = upgrade_runner.start(
+                    stop_after=up_opts.get("stop_after"),
+                    reboot_timeout=up_opts.get("reboot_timeout"),
+                )
                 try:
                     chan.send(msg.encode("utf-8", errors="replace"))
                     chan.send_exit_status(0 if started else 1)
@@ -798,7 +803,17 @@ def main():
     parser.add_argument(
         "--skip-uboot-update",
         action="store_true",
-        help="FIP slices only; skip U-Boot fip.bin phase (stay in U-Boot CLI)",
+        help="FIP slices only; skip U-Boot fip.bin phase (same as --stop-after fip)",
+    )
+    parser.add_argument(
+        "--stop-after",
+        default=None,
+        metavar="STAGE",
+        help=(
+            "Stop UART download after a stage and release serial for target CLI "
+            "(e.g. bl31, bl2, fip, fip.bin). BL31 maps to monitor.bin. "
+            "Overrides --skip-uboot-update when set."
+        ),
     )
     parser.add_argument(
         "--uart-debug",
@@ -842,6 +857,7 @@ def main():
         debug=args.uart_debug,
         debug_ssh=args.uart_debug_ssh,
         skip_uboot_update=args.skip_uboot_update,
+        stop_after=args.stop_after,
     )
     if args.uart_debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -884,6 +900,8 @@ def main():
         f"exec_queue={args.exec_queue_size}"
     )
     log.info(f"UART work dir: {upgrade_runner.uart_dl_dir}")
+    if upgrade_runner.stop_after:
+        log.info(f"UART stop-after: {upgrade_runner.stop_after}")
     deps = check_uart_upgrade_deps(args.uart_dl_dir, None)
     if deps.ok:
         log.info("UART upgrade dependency check passed")

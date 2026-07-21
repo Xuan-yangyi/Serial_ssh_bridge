@@ -4,6 +4,7 @@
 import importlib.util
 import logging
 import os
+import shlex
 import sys
 import threading
 import time
@@ -102,8 +103,58 @@ def is_upgrade_command(command: str) -> bool:
     cmd = (command or "").strip()
     if cmd in UPGRADE_COMMANDS:
         return True
-    # allow: uart-upgrade [--reboot-timeout 120]
+    # allow: uart-upgrade [--reboot-timeout 120] [--stop-after bl31]
     return cmd.split()[0] in UPGRADE_COMMANDS if cmd else False
+
+
+def effective_stop_after(
+    stop_after: Optional[str], skip_uboot_update: bool
+) -> Optional[str]:
+    """CLI --stop-after wins; --skip-uboot-update is shorthand for stop-after fip."""
+    if stop_after:
+        return stop_after
+    if skip_uboot_update:
+        return "fip"
+    return None
+
+
+def parse_upgrade_command(command: str) -> dict:
+    """
+    Parse SSH exec upgrade command options.
+    Example: uart-upgrade --stop-after bl31 --reboot-timeout 120
+    """
+    opts: dict = {"stop_after": None, "reboot_timeout": None}
+    cmd = (command or "").strip()
+    if not cmd:
+        return opts
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return opts
+    if not tokens or tokens[0] not in UPGRADE_COMMANDS:
+        return opts
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("--stop-after", "--stop-at"):
+            if i + 1 < len(tokens):
+                opts["stop_after"] = tokens[i + 1]
+                i += 2
+                continue
+        if tok.startswith("--stop-after=") or tok.startswith("--stop-at="):
+            opts["stop_after"] = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok == "--reboot-timeout" and i + 1 < len(tokens):
+            opts["reboot_timeout"] = float(tokens[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--reboot-timeout="):
+            opts["reboot_timeout"] = float(tok.split("=", 1)[1])
+            i += 1
+            continue
+        i += 1
+    return opts
 
 
 def _bundled_data_dir() -> str:
@@ -304,6 +355,7 @@ class UartUpgradeRunner:
         reboot_timeout: float = DEFAULT_REBOOT_TIMEOUT,
         uboot_baudrate: Optional[int] = None,
         skip_uboot_update: bool = False,
+        stop_after: Optional[str] = None,
         retries: int = 3,
         retry_delay: float = 2.0,
         debug: bool = False,
@@ -314,6 +366,7 @@ class UartUpgradeRunner:
         self.reboot_timeout = reboot_timeout
         self.uboot_baudrate = uboot_baudrate
         self.skip_uboot_update = skip_uboot_update
+        self.stop_after = effective_stop_after(stop_after, skip_uboot_update)
         self.retries = max(1, int(retries))
         self.retry_delay = float(retry_delay)
         self.debug = debug
@@ -328,9 +381,15 @@ class UartUpgradeRunner:
     def is_running(self) -> bool:
         return self._running
 
-    def start(self, on_done: Optional[Callable[[bool, str], None]] = None) -> tuple:
+    def start(
+        self,
+        on_done: Optional[Callable[[bool, str], None]] = None,
+        stop_after: Optional[str] = None,
+        reboot_timeout: Optional[float] = None,
+    ) -> tuple:
         """
         Start upgrade in background. Returns (started: bool, message: str).
+        Per-invocation stop_after / reboot_timeout override runner defaults.
         """
         with self._lock:
             if self._running:
@@ -343,12 +402,19 @@ class UartUpgradeRunner:
             if not self.serial_mgr or not self.serial_mgr.ser:
                 return False, "Serial port not available — cannot run UART upgrade\r\n"
 
+            run_stop = stop_after if stop_after is not None else self.stop_after
+            run_reboot = (
+                reboot_timeout if reboot_timeout is not None else self.reboot_timeout
+            )
+
             self._running = True
             self._last_error = None
             self._last_ok = None
 
             def _target():
-                ok, msg = self._run_upgrade()
+                ok, msg = self._run_upgrade(
+                    stop_after=run_stop, reboot_timeout=run_reboot
+                )
                 self._last_ok = ok
                 self._last_error = None if ok else msg
                 self._running = False
@@ -360,15 +426,26 @@ class UartUpgradeRunner:
             )
             self._thread.start()
             report = deps.format_report()
+            stop_note = ""
+            if run_stop:
+                stop_note = f"[upgrade] stop-after: {run_stop}\r\n"
             return True, (
                 report
+                + stop_note
                 + "\r\n[upgrade] Started — waiting for device reboot (URPL)...\r\n"
                 + "Reboot the board into UART download mode. Progress streams to all SSH shells.\r\n"
             )
 
-    def _run_upgrade(self) -> tuple:
+    def _run_upgrade(
+        self,
+        stop_after: Optional[str] = None,
+        reboot_timeout: Optional[float] = None,
+    ) -> tuple:
         ensure_uart_dl_path(self.uart_dl_dir)
-        from uart_dl_core import UartDownload
+        from uart_dl_core import UartDownload, format_stop_after_help, normalize_stop_after
+
+        reboot_timeout = reboot_timeout if reboot_timeout is not None else self.reboot_timeout
+        stop_after = stop_after if stop_after is not None else self.stop_after
 
         def on_status(msg: str):
             line = f"[upgrade] {msg}\r\n"
@@ -385,10 +462,19 @@ class UartUpgradeRunner:
 
         self.serial_mgr.begin_upgrade()
         try:
+            try:
+                resolved_stop = normalize_stop_after(stop_after)
+            except ValueError as e:
+                on_status(f"ERROR: {e}")
+                on_status(format_stop_after_help())
+                return False, f"UART upgrade aborted: {e}\r\n"
+
             last_err: Optional[Exception] = None
             for attempt in range(1, self.retries + 1):
                 try:
                     on_status(f"Upgrade attempt {attempt}/{self.retries}")
+                    if resolved_stop:
+                        on_status(f"Will stop after: {resolved_stop}")
                     adapter = BridgeSerialAdapter(self.serial_mgr, debug=self.debug)
                     dl = UartDownload(
                         adapter,
@@ -398,10 +484,14 @@ class UartUpgradeRunner:
                         on_status=on_status,
                         uboot_baudrate=self.uboot_baudrate,
                         skip_uboot_update=self.skip_uboot_update,
+                        stop_after=stop_after,
                         debug=self.debug,
                         debug_ssh=self.debug_ssh,
                     )
-                    dl.start(reboot_timeout=self.reboot_timeout)
+                    dl.start(reboot_timeout=reboot_timeout)
+                    if resolved_stop:
+                        on_status("Stopped at configured stage; serial released.")
+                        return True, "UART upgrade stopped at configured stage; serial released\r\n"
                     on_status("All stages completed.")
                     return True, "UART upgrade completed successfully\r\n"
                 except Exception as e:

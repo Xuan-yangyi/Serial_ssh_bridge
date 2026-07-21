@@ -107,6 +107,16 @@ serial-ssh-bridge/          # 建议 GitHub 仓库名
 3. 启动 Claude，执行 `/mcp`，确认 terminal 已正常加载。
 4. 让 Claude 先读取 Skill，理解完整工作流后再操作设备。
 
+**MCP 终端频繁断开？**  
+`mcp-interactive-terminal` 期望 SSH 会话里有一个**持久的交互式 shell**（有提示符、有回显）。旧版 bridge 在 banner 打印后直接进入**裸串口透传**，串口无输出时终端像“死掉”一样，MCP 会误判会话结束。
+
+默认已启用 `--shell-mode auto`：客户端申请 PTY（MCP/交互式 SSH）时进入 **bridge 管理 shell**（`bridge>` 提示符），可用 `attach` 进入串口透传、`status` 查看状态；普通 `ssh` 非 PTY 仍保持直通模式。也可显式指定：
+
+```powershell
+.\serial_ssh_bridge.exe -p COM3 --ssh-port 2222 --shell-mode bridge   # 始终管理 shell（推荐给 MCP）
+.\serial_ssh_bridge.exe -p COM3 --ssh-port 2222 --shell-mode passthrough  # 始终裸透传
+```
+
 ### Claude Skill 准备
 
 1. Skill 文件可放在 `.claude/skills/` 目录。
@@ -115,13 +125,12 @@ serial-ssh-bridge/          # 建议 GitHub 仓库名
 
 ## 快速开始（Windows 预编译 exe）
 
-1. 将 `fip.bin` 放到与 `serial_ssh_bridge.exe` **同级目录**（例如 `bridge/dist/`）,注意需要在uboot 下的cvi_update.c 中将下载波特率改成115200
-   串口升级在uboot阶段才不会报错
-3. 启动 bridge：
+1. 将 `fip.bin` 放到与 `serial_ssh_bridge.exe` **同级目录**（例如 `bridge/dist/`）
+2. 启动 bridge：
 
 ```powershell
 cd bridge\dist
-.\serial_ssh_bridge.exe -p COM3 -b 115200 --ssh-port 2222 --uboot-baudrate 115200
+.\serial_ssh_bridge.exe -p COM3 -b 115200 --ssh-port 2222
 ```
 
 1. 选择对接方式（二选一）：
@@ -133,8 +142,7 @@ cd bridge\dist
 3. 在 Claude 中确认 MCP `mcp-interactive-terminal` 已连接（`/mcp` 检查）。
 4. 向 Claude 下达指令，例如读取设备串口输出、执行 `uart-upgrade` 等。
 5. 可以使用Deepseek-V4-Flash，消耗费用较少
-### 演示视频
-https://github.com/user-attachments/assets/f5fc135c-5cf8-4dd7-a395-6777bbb5149f
+
 #### 方式 B：手动 SSH（不使用 Claude）
 
 **B.1 SSH Shell 透传串口**
@@ -307,7 +315,8 @@ Linux 不能使用 Windows 的 exe。若需在 Ubuntu 上分发，请在目标�
 | `--uart-dl-dir`         | exe/脚本所在目录     | 存放 `fip.bin` 的工作目录              |
 | `--uart-reboot-timeout` | `300`          | 等待 URPL 超时（秒）                   |
 | `--uboot-baudrate`      | `1500000`      | U-Boot 阶段 Kermit 波特率            |
-| `--skip-uboot-update`   | 关闭             | 仅 FIP 分段，跳过 U-Boot `fip.bin`    |
+| `--skip-uboot-update`   | 关闭             | 仅 FIP 分段，跳过 U-Boot `fip.bin`（等同 `--stop-after fip`） |
+| `--stop-after STAGE`    | 无（烧录全流程）       | 在指定阶段后停止并释放串口供目标 CLI 使用（见下表）          |
 | `--uart-debug`          | 关闭             | 写 `log/uart_debug.log` 等详细日志    |
 | `--uart-debug-ssh`      | 关闭             | 调试信息同步到 SSH（需配合 `--uart-debug`） |
 | `--check-deps`          | -              | 检查依赖后退出                         |
@@ -323,7 +332,32 @@ Linux 不能使用 Windows 的 exe。若需在 Ubuntu 上分发，请在目标�
 
 ```powershell
 .\serial_ssh_bridge.exe -p COM3 --skip-uboot-update
+# 或等价：
+.\serial_ssh_bridge.exe -p COM3 --stop-after fip
 ```
+
+### 示例：烧到 BL31 后停止，与 BL31 CLI 交互
+
+本仓库 FIP 布局中 **BL31 对应 `monitor.bin`**。烧录完成后串口交还给 SSH 透传 / `attach`：
+
+```powershell
+.\serial_ssh_bridge.exe -p COM3 --stop-after bl31
+```
+
+也可在 SSH exec 中临时指定（覆盖启动参数）：
+
+```bash
+ssh -p 2222 admin@<bridge_ip> uart-upgrade --stop-after bl31
+```
+
+**`--stop-after` 可选阶段：**
+
+| 参数值 | 含义 |
+|--------|------|
+| `bl2`, `p2`, `bl31`/`monitor`, `bl32`, `mcu`, `l2`, `l2h`, `param1` | 对应 FIP 切片烧录完成后停止 |
+| `fip` | 全部 FIP 切片烧完即停（不进 U-Boot 整包阶段） |
+| `fip.bin` | U-Boot 整包 `fip.bin` 发完后停止 |
+| 不指定 / `full` | 完整流程（默认） |
 
 ## SCP 上传文件到 bridge
 
